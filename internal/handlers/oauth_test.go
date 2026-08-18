@@ -155,3 +155,76 @@ func TestHandleTokenProxy_OverridesRedirectURI(t *testing.T) {
 		t.Error("expected client_secret to be injected")
 	}
 }
+
+func TestHandleAuthorizeProxy_RequestsOfflineAccess(t *testing.T) {
+	q := url.Values{"client_id": {"x"}, "redirect_uri": {"http://localhost:51000/callback"}}
+	req := httptest.NewRequest("GET", "/authorize?"+q.Encode(), nil)
+	rec := httptest.NewRecorder()
+	handlers.HandleAuthorizeProxy(oauthConfig()).ServeHTTP(rec, req)
+
+	loc, err := url.Parse(rec.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("unparseable Location: %v", err)
+	}
+	if got := loc.Query().Get("access_type"); got != "offline" {
+		t.Errorf("access_type = %q, want offline so the provider issues a refresh token", got)
+	}
+	if got := loc.Query().Get("prompt"); got != "consent" {
+		t.Errorf("prompt = %q, want consent so the refresh token is actually handed out", got)
+	}
+}
+
+func TestHandleAuthorizeProxy_KeepsClientOfflineParams(t *testing.T) {
+	q := url.Values{
+		"client_id":    {"x"},
+		"redirect_uri": {"http://localhost:51000/callback"},
+		"access_type":  {"online"},
+		"prompt":       {"none"},
+	}
+	req := httptest.NewRequest("GET", "/authorize?"+q.Encode(), nil)
+	rec := httptest.NewRecorder()
+	handlers.HandleAuthorizeProxy(oauthConfig()).ServeHTTP(rec, req)
+
+	loc, _ := url.Parse(rec.Header().Get("Location"))
+	if got := loc.Query().Get("access_type"); got != "online" {
+		t.Errorf("access_type = %q, want the client's own value preserved", got)
+	}
+	if got := loc.Query().Get("prompt"); got != "none" {
+		t.Errorf("prompt = %q, want the client's own value preserved", got)
+	}
+}
+
+func TestHandleTokenProxy_LeavesRefreshGrantAlone(t *testing.T) {
+	var got url.Values
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		got = r.Form
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"t"}`))
+	}))
+	defer upstream.Close()
+
+	cfg := oauthConfig()
+	cfg.OAuthTokenURL = upstream.URL
+
+	form := url.Values{"grant_type": {"refresh_token"}, "refresh_token": {"r"}}
+	req := httptest.NewRequest("POST", "/token", strings.NewReader(form.Encode()))
+	req.Host = "vault.example.com"
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	handlers.HandleTokenProxy(cfg).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	if got.Has("redirect_uri") {
+		t.Errorf("refresh grant must not carry a redirect_uri, got %q", got.Get("redirect_uri"))
+	}
+	if got.Get("refresh_token") != "r" {
+		t.Error("expected the refresh token to be forwarded")
+	}
+	if got.Get("client_secret") != "test-secret" {
+		t.Error("expected client_secret to be injected on refresh too")
+	}
+}

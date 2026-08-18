@@ -126,6 +126,18 @@ func HandleAuthorizeProxy(cfg *config.Config) http.HandlerFunc {
 			params.Set("scope", "openid email profile")
 		}
 
+		// Ask for offline access so the provider issues a refresh token, and for a
+		// fresh consent because Google only hands the refresh token out when consent
+		// is granted again. Without both, our metadata advertises a refresh_token
+		// grant the flow can never satisfy and the client re-authenticates by hand
+		// every time the access token expires. A client that sets these itself wins.
+		if params.Get("access_type") == "" {
+			params.Set("access_type", "offline")
+		}
+		if params.Get("prompt") == "" {
+			params.Set("prompt", "consent")
+		}
+
 		clientRedirect := params.Get("redirect_uri")
 		if validRedirectURI(clientRedirect) {
 			state, err := encodeState(cfg, authState{
