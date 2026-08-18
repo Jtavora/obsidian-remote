@@ -3,11 +3,9 @@ package handlers
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
@@ -18,11 +16,7 @@ func HandleDiscovery(cfg *config.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
-		scheme := "http"
-		if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
-			scheme = "https"
-		}
-		host := fmt.Sprintf("%s://%s", scheme, r.Host)
+		host := requestHost(r)
 
 		resourcePath := strings.TrimPrefix(r.URL.Path, "/.well-known/oauth-protected-resource")
 		if resourcePath == "" {
@@ -50,11 +44,7 @@ func HandleAuthServerDiscovery(cfg *config.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
-		scheme := "http"
-		if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
-			scheme = "https"
-		}
-		host := fmt.Sprintf("%s://%s", scheme, r.Host)
+		host := requestHost(r)
 
 		// This is the RFC 8414 / OpenID Configuration the CLI is looking for
 		res := map[string]interface{}{
@@ -67,6 +57,7 @@ func HandleAuthServerDiscovery(cfg *config.Config) http.HandlerFunc {
 			"grant_types_supported":            []string{"authorization_code", "refresh_token"},
 			"scopes_supported":                 []string{"openid", "email", "profile"},
 			"code_challenge_methods_supported": []string{"S256"},
+			"authorization_response_iss_parameter_supported": true,
 		}
 
 		if err := json.NewEncoder(w).Encode(res); err != nil {
@@ -108,54 +99,6 @@ func HandleRegistration(cfg *config.Config) http.HandlerFunc {
 		w.WriteHeader(http.StatusCreated)
 		if err := json.NewEncoder(w).Encode(res); err != nil {
 			slog.Error("failed to encode registration response", "error", err)
-		}
-	}
-}
-
-func HandleAuthorizeProxy(cfg *config.Config) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		params := r.URL.Query()
-		if params.Get("scope") == "" {
-			params.Set("scope", "openid email profile")
-		}
-		target := cfg.OAuthAuthorizeURL + "?" + params.Encode()
-		http.Redirect(w, r, target, http.StatusFound)
-	}
-}
-
-func HandleTokenProxy(cfg *config.Config) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		if err := r.ParseForm(); err != nil {
-			http.Error(w, "Bad request", http.StatusBadRequest)
-			return
-		}
-
-		form := url.Values{}
-		for k, v := range r.Form {
-			form[k] = v
-		}
-		form.Set("client_id", cfg.OAuthAudience)
-		if cfg.OAuthClientSecret != "" {
-			form.Set("client_secret", cfg.OAuthClientSecret)
-		}
-
-		resp, err := http.PostForm(cfg.OAuthTokenURL, form)
-		if err != nil {
-			slog.Error("token proxy: upstream request failed", "error", err)
-			http.Error(w, "Token exchange failed", http.StatusBadGateway)
-			return
-		}
-		defer func() { _ = resp.Body.Close() }()
-
-		w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
-		w.WriteHeader(resp.StatusCode)
-		if _, err := io.Copy(w, resp.Body); err != nil {
-			slog.Error("token proxy: failed to write response", "error", err)
 		}
 	}
 }
