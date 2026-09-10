@@ -3,6 +3,7 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -795,4 +796,122 @@ func TestHandleManageFrontmatter(t *testing.T) {
 			t.Fatal("expected error for missing params")
 		}
 	})
+}
+
+// legacyPatchRecorder emulates a Local REST API old enough to require
+// header-based targeting: it rejects the JSON-body PATCH the way the plugin
+// does, then records the retry.
+type legacyPatchRecorder struct {
+	calls   int
+	headers http.Header
+	body    string
+}
+
+func (r *legacyPatchRecorder) handler(w http.ResponseWriter, req *http.Request) {
+	r.calls++
+	if req.Header.Get("Target-Type") == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"errorCode":40053,"message":"No 'Target-Type' header was provided."}`))
+		return
+	}
+	body, _ := io.ReadAll(req.Body)
+	r.headers = req.Header.Clone()
+	r.body = string(body)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func TestHandleManageFrontmatterLegacyFallback(t *testing.T) {
+	rec := &legacyPatchRecorder{}
+	client := newTestClient(t, rec.handler)
+
+	handler := handleManageFrontmatter(client)
+	req := &mcp.CallToolRequest{Params: &mcp.CallToolParamsRaw{Arguments: mustMarshalArgs(map[string]any{
+		"path":        "notes/test.md",
+		"operation":   "set",
+		"jsonPayload": `{"status":"encerrado"}`,
+	})}}
+	result, err := handler(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("expected success after fallback, got error: %v", getText(result))
+	}
+	if rec.calls != 2 {
+		t.Fatalf("calls = %d, want 2 (JSON attempt + legacy retry)", rec.calls)
+	}
+	if got := rec.headers.Get("Target-Type"); got != "frontmatter" {
+		t.Fatalf("Target-Type = %q, want frontmatter", got)
+	}
+	if got := rec.headers.Get("Target"); got != "status" {
+		t.Fatalf("Target = %q, want status", got)
+	}
+	if got := rec.headers.Get("Operation"); got != "replace" {
+		t.Fatalf("Operation = %q, want replace", got)
+	}
+	if rec.body != `"encerrado"` {
+		t.Fatalf("legacy body = %s, want the bare JSON value", rec.body)
+	}
+}
+
+func TestHandleUpdateNoteLegacyFallback(t *testing.T) {
+	rec := &legacyPatchRecorder{}
+	client := newTestClient(t, rec.handler)
+
+	handler := handleUpdateNote(client)
+	req := &mcp.CallToolRequest{Params: &mcp.CallToolParamsRaw{Arguments: mustMarshalArgs(map[string]any{
+		"path":        "notes/test.md",
+		"content":     "novo texto",
+		"operation":   "append",
+		"target_type": "heading",
+		"target":      "Topo::Referências",
+	})}}
+	result, err := handler(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("expected success after fallback, got error: %v", getText(result))
+	}
+	if rec.calls != 2 {
+		t.Fatalf("calls = %d, want 2 (JSON attempt + legacy retry)", rec.calls)
+	}
+	if got := rec.headers.Get("Target"); got != "Topo::Refer%C3%AAncias" {
+		t.Fatalf("Target = %q, want each segment percent-encoded around the delimiter", got)
+	}
+	if got := rec.headers.Get("Operation"); got != "append" {
+		t.Fatalf("Operation = %q, want append", got)
+	}
+	if rec.body != "novo texto" {
+		t.Fatalf("legacy body = %q, want the raw content", rec.body)
+	}
+}
+
+func TestHandleUpdateNoteFailureIsNotRetried(t *testing.T) {
+	var calls int
+	client := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"errorCode":40400,"message":"Not found"}`))
+	})
+
+	handler := handleUpdateNote(client)
+	req := &mcp.CallToolRequest{Params: &mcp.CallToolParamsRaw{Arguments: mustMarshalArgs(map[string]any{
+		"path":        "notes/missing.md",
+		"content":     "x",
+		"target_type": "frontmatter",
+		"target":      "status",
+	})}}
+	result, err := handler(context.Background(), req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.IsError {
+		t.Fatal("expected the 404 to surface as an error")
+	}
+	if calls != 1 {
+		t.Fatalf("calls = %d, want 1: only missing-header 400s are retried", calls)
+	}
 }

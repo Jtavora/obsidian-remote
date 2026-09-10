@@ -3,6 +3,8 @@ package obsidian
 import (
 	"bytes"
 	"crypto/tls"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -53,10 +55,46 @@ func (c *Client) Call(method, path string, body []byte, headers ...map[string]st
 	}
 
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("obsidian API %s %s returned %d: %s", method, path, resp.StatusCode, respBody)
+		return nil, &APIError{Method: method, Path: path, StatusCode: resp.StatusCode, Body: respBody}
 	}
 
 	return respBody, nil
+}
+
+// APIError is a non-2xx response from the Obsidian Local REST API.
+type APIError struct {
+	Method     string
+	Path       string
+	StatusCode int
+	Body       []byte
+}
+
+func (e *APIError) Error() string {
+	return fmt.Sprintf("obsidian API %s %s returned %d: %s", e.Method, e.Path, e.StatusCode, e.Body)
+}
+
+// errorCodeMissingTargetTypeHeader is what the Local REST API returns when a PATCH
+// carries no Target-Type header. Plugin versions older than the JSON request body
+// support only header-based targeting, so they reject our JSON body with this code.
+const errorCodeMissingTargetTypeHeader = 40053
+
+// LegacyTargetingRequired reports whether err came from a plugin that only
+// understands header-based targeting, meaning the PATCH is worth retrying with
+// the legacy headers.
+func LegacyTargetingRequired(err error) bool {
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusBadRequest {
+		return false
+	}
+	var payload struct {
+		ErrorCode int    `json:"errorCode"`
+		Message   string `json:"message"`
+	}
+	if json.Unmarshal(apiErr.Body, &payload) != nil {
+		return false
+	}
+	return payload.ErrorCode == errorCodeMissingTargetTypeHeader ||
+		strings.Contains(payload.Message, "Target-Type")
 }
 
 // contentTypeFor returns the appropriate Content-Type for an Obsidian REST API request.

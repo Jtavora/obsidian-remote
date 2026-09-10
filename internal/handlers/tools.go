@@ -174,6 +174,78 @@ func targetSegments(target, delimiter string) []string {
 	return strings.Split(target, delimiter)
 }
 
+// encodeTarget URL-escapes each segment of a target while keeping the delimiter
+// intact, as required by the legacy Target header.
+func encodeTarget(target, delimiter string) string {
+	if delimiter == "" {
+		delimiter = "::"
+	}
+	parts := strings.Split(target, delimiter)
+	for i, p := range parts {
+		parts[i] = url.PathEscape(p)
+	}
+	return strings.Join(parts, delimiter)
+}
+
+// legacyPatchHeaders builds the header-based targeting that plugin versions
+// predating the JSON request body expect on PATCH.
+func legacyPatchHeaders(req *mcp.CallToolRequest, targetType, target, operation string) map[string]string {
+	delimiter := getStringArg(req, "target_delimiter", "")
+	headers := map[string]string{
+		"Operation":   operation,
+		"Target-Type": targetType,
+		"Target":      encodeTarget(target, delimiter),
+	}
+	if delimiter != "" {
+		headers["Target-Delimiter"] = delimiter
+	}
+	if scope := getStringArg(req, "target_scope", ""); scope != "" {
+		headers["Target-Scope"] = scope
+	}
+	for _, opt := range []struct{ field, key string }{
+		{"create_target_if_missing", "Create-Target-If-Missing"},
+		{"reject_if_content_preexists", "Reject-If-Content-Preexists"},
+		{"trim_target_whitespace", "Trim-Target-Whitespace"},
+	} {
+		if getStringArg(req, opt.field, "") == "true" {
+			headers[opt.key] = "true"
+		}
+	}
+	return headers
+}
+
+// frontmatterLegacyHeaders is the header-based equivalent of replacing a single
+// frontmatter key, used when falling back on an older plugin.
+func frontmatterLegacyHeaders(key string) map[string]string {
+	return map[string]string{
+		"Content-Type":             "application/json",
+		"Operation":                "replace",
+		"Target-Type":              "frontmatter",
+		"Target":                   url.PathEscape(key),
+		"Create-Target-If-Missing": "true",
+	}
+}
+
+// patchWithLegacyFallback sends a PATCH carrying targeting in the JSON body and,
+// when the plugin rejects it for lack of a Target-Type header, retries the same
+// edit with header-based targeting. Keeps older Local REST API installs working
+// without giving up the non-deprecated path on current ones.
+func patchWithLegacyFallback(
+	client *obsidian.Client,
+	path string,
+	jsonBody []byte,
+	legacyBody []byte,
+	legacyHeaders map[string]string,
+) error {
+	_, err := client.Call("PATCH", "/vault/"+path, jsonBody,
+		map[string]string{"Content-Type": "application/json"})
+	if err == nil || !obsidian.LegacyTargetingRequired(err) {
+		return err
+	}
+	_, retryErr := client.Call("PATCH", "/vault/"+path, legacyBody, legacyHeaders)
+	return retryErr
+}
+
 func patchBody(targetType, target, delimiter, operation, content string, value any, req *mcp.CallToolRequest) ([]byte, error) {
 	var t any
 	if targetType == "heading" {
@@ -275,9 +347,11 @@ func resolveUpdateMethod(op string, hasTarget bool) (string, error) {
 }
 
 type updateNoteParams struct {
-	path   string
-	method string
-	body   []byte
+	path          string
+	method        string
+	body          []byte
+	legacyBody    []byte
+	legacyHeaders map[string]string
 }
 
 func parseUpdateNote(req *mcp.CallToolRequest) (*updateNoteParams, error) {
@@ -302,18 +376,21 @@ func parseUpdateNote(req *mcp.CallToolRequest) (*updateNoteParams, error) {
 		return nil, err
 	}
 
-	var body []byte
+	var body, legacyBody []byte
+	var legacyHeaders map[string]string
 	if hasTarget {
 		delimiter := getStringArg(req, "target_delimiter", "")
 		body, err = patchBody(targetType, target, delimiter, op, content, nil, req)
 		if err != nil {
 			return nil, err
 		}
+		legacyBody = []byte(content)
+		legacyHeaders = legacyPatchHeaders(req, targetType, target, op)
 	} else {
 		body = []byte(content)
 	}
 
-	return &updateNoteParams{path, method, body}, nil
+	return &updateNoteParams{path, method, body, legacyBody, legacyHeaders}, nil
 }
 
 func handleUpdateNote(client *obsidian.Client) mcp.ToolHandler {
@@ -322,11 +399,11 @@ func handleUpdateNote(client *obsidian.Client) mcp.ToolHandler {
 		if err != nil {
 			return errorResult(err.Error()), nil
 		}
-	var headers map[string]string
-	if params.method == "PATCH" {
-		headers = map[string]string{"Content-Type": "application/json"}
-	}
-	_, err = client.Call(params.method, "/vault/"+params.path, params.body, headers)
+		if params.method == "PATCH" {
+			err = patchWithLegacyFallback(client, params.path, params.body, params.legacyBody, params.legacyHeaders)
+		} else {
+			_, err = client.Call(params.method, "/vault/"+params.path, params.body)
+		}
 		if err != nil {
 			return errorResult(err.Error()), nil
 		}
@@ -341,16 +418,16 @@ func registerUpdateNote(s *mcp.Server, client *obsidian.Client) {
 		InputSchema: &jsonschema.Schema{
 			Type: "object",
 			Properties: map[string]*jsonschema.Schema{
-				"path":                         {Type: "string"},
-				"content":                      {Type: "string"},
-				"operation":                    {Type: "string", Description: "replace (default), append, or prepend"},
-				"target_type":                  {Type: "string", Description: "Section type: heading, block, or frontmatter"},
-				"target":                       {Type: "string", Description: "Heading text, block reference, or frontmatter key"},
-				"target_scope":                 {Type: "string", Description: "Scope for heading/block targets: content, marker, or markerAndContent"},
-				"target_delimiter":             {Type: "string", Description: "Delimiter for nested headings (default: ::)"},
-				"create_target_if_missing":     {Type: "string", Description: "Create the target if it does not exist (true or false)"},
-				"reject_if_content_preexists":  {Type: "string", Description: "Reject if target already has content (true or false)"},
-				"trim_target_whitespace":       {Type: "string", Description: "Trim whitespace from target content before operation (true or false)"},
+				"path":                        {Type: "string"},
+				"content":                     {Type: "string"},
+				"operation":                   {Type: "string", Description: "replace (default), append, or prepend"},
+				"target_type":                 {Type: "string", Description: "Section type: heading, block, or frontmatter"},
+				"target":                      {Type: "string", Description: "Heading text, block reference, or frontmatter key"},
+				"target_scope":                {Type: "string", Description: "Scope for heading/block targets: content, marker, or markerAndContent"},
+				"target_delimiter":            {Type: "string", Description: "Delimiter for nested headings (default: ::)"},
+				"create_target_if_missing":    {Type: "string", Description: "Create the target if it does not exist (true or false)"},
+				"reject_if_content_preexists": {Type: "string", Description: "Reject if target already has content (true or false)"},
+				"trim_target_whitespace":      {Type: "string", Description: "Trim whitespace from target content before operation (true or false)"},
 			},
 			Required: []string{"path", "content"},
 		},
@@ -606,17 +683,20 @@ func handleManageTags(client *obsidian.Client) mcp.ToolHandler {
 		}
 
 		body, err := json.Marshal(map[string]any{
-			"targetType":             "frontmatter",
-			"target":                 "tags",
-			"operation":              "replace",
-			"value":                  tags,
-			"createTargetIfMissing":  true,
+			"targetType":            "frontmatter",
+			"target":                "tags",
+			"operation":             "replace",
+			"value":                 tags,
+			"createTargetIfMissing": true,
 		})
 		if err != nil {
 			return errorResult("failed to marshal patch body: " + err.Error()), nil
 		}
-		if _, err := client.Call("PATCH", "/vault/"+path, body,
-			map[string]string{"Content-Type": "application/json"}); err != nil {
+		tagsJSON, err := json.Marshal(tags)
+		if err != nil {
+			return errorResult("failed to marshal tags: " + err.Error()), nil
+		}
+		if err := patchWithLegacyFallback(client, path, body, tagsJSON, frontmatterLegacyHeaders("tags")); err != nil {
 			return errorResult(err.Error()), nil
 		}
 
@@ -680,19 +760,24 @@ func handleManageFrontmatter(client *obsidian.Client) mcp.ToolHandler {
 			var errs []string
 			for k, v := range kvs {
 				body, marshalErr := json.Marshal(map[string]any{
-					"targetType":             "frontmatter",
-					"target":                 k,
-					"operation":              "replace",
-					"value":                  v,
-					"createTargetIfMissing":  true,
+					"targetType":            "frontmatter",
+					"target":                k,
+					"operation":             "replace",
+					"value":                 v,
+					"createTargetIfMissing": true,
 				})
 				if marshalErr != nil {
 					errs = append(errs, k+": failed to marshal patch body: "+marshalErr.Error())
 					continue
 				}
-				_, patchErr := client.Call("PATCH", "/vault/"+path, body,
-					map[string]string{"Content-Type": "application/json"})
-				if patchErr != nil {
+				legacyValue, marshalErr := json.Marshal(v)
+				if marshalErr != nil {
+					errs = append(errs, k+": failed to marshal value: "+marshalErr.Error())
+					continue
+				}
+				if patchErr := patchWithLegacyFallback(
+					client, path, body, legacyValue, frontmatterLegacyHeaders(k),
+				); patchErr != nil {
 					errs = append(errs, k+": "+patchErr.Error())
 				}
 			}
