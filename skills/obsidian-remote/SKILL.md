@@ -43,9 +43,9 @@ Create, overwrite, append, or prepend content within a note.
 
 | Parameter                     | Values                                            |
 | ----------------------------- | ------------------------------------------------- |
-| `operation`                   | `replace` (default), `append`, or `prepend`       |
+| `operation`                   | `replace`, `append`, or `prepend` (see below)     |
 | `target_type`                 | `heading`, `block`, or `frontmatter`              |
-| `target`                      | Heading text, block ref, or frontmatter key       |
+| `target`                      | Heading text or path, block ref, frontmatter key  |
 | `target_scope`                | `content` (default), `marker`, `markerAndContent` |
 | `target_delimiter`            | Default `::`                                      |
 | `create_target_if_missing`    | `"true"` to create target if absent               |
@@ -116,6 +116,9 @@ Never skip confirmation. No exceptions.
 
 - **`prepend` requires a target** — you cannot prepend to an entire file. Use `operation=append` with no target to add content at the end.
 - **`target_type` and `target` are a pair** — providing one without the other is an error.
+- **`operation` has no silent default where content can be lost** — it is required when targeting a heading or block, and when writing to a note that already exists without a target. It defaults to `replace` only for a frontmatter key or a new note. To change part of a note, use `search_replace`.
+- **A heading can be given by its own text** — `"Referências"` resolves to `"Topo::Referências"` when it is unique in the note; if several headings share the text, the error lists the full paths to choose from.
+- **`list_notes` takes `dirPath`** — `path` is accepted as an alias.
 - **`target_scope` only applies to `heading` and `block`** — it is ignored for `frontmatter` targets.
 - **Boolean params are strings** — `create_target_if_missing`, `reject_if_content_preexists`, and `trim_target_whitespace` expect `"true"` (a string), not `true` (a boolean).
 - **Nested headings use `::`** — target `"Projects::Active"` not `"Projects/Active"` or `"Projects > Active"`.

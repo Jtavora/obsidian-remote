@@ -28,7 +28,7 @@ func main() {
 	obsClient := obsidian.NewClient(cfg)
 
 	s := mcp.NewServer(&mcp.Implementation{Name: "Obsidian Remote (Go)", Version: version}, nil)
-	handlers.RegisterTools(s, obsClient)
+	handlers.RegisterTools(s, obsClient, cfg)
 
 	var jwks *keyfunc.JWKS
 	var err error

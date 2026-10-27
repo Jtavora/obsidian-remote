@@ -3,20 +3,26 @@ package handlers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/shanehull/obsidian-remote/internal/config"
 	"github.com/shanehull/obsidian-remote/internal/obsidian"
 )
 
-func RegisterTools(s *mcp.Server, client *obsidian.Client) {
+func RegisterTools(s *mcp.Server, client *obsidian.Client, cfg *config.Config) {
 	registerListNotes(s, client)
 	registerReadNote(s, client)
 	registerUpdateNote(s, client)
-	registerDeleteNote(s, client)
+	if !cfg.DisableDelete {
+		registerDeleteNote(s, client)
+	}
 	registerMoveNote(s, client)
 	registerGlobalSearch(s, client)
 	registerSearchReplace(s, client)
@@ -110,7 +116,9 @@ func errorResult(msg string) *mcp.CallToolResult {
 
 func handleListNotes(client *obsidian.Client) mcp.ToolHandler {
 	return func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		subDir := normalizePath(getStringArg(req, "dirPath", ""))
+		// "path" is accepted as an alias: callers reach for it by analogy with the
+		// other tools, and silently listing the vault root instead looks like a bug.
+		subDir := normalizePath(getStringArg(req, "dirPath", getStringArg(req, "path", "")))
 		res, err := client.Call("GET", "/vault/"+subDir, nil)
 		if err != nil {
 			return errorResult(err.Error()), nil
@@ -126,7 +134,7 @@ func registerListNotes(s *mcp.Server, client *obsidian.Client) {
 		InputSchema: &jsonschema.Schema{
 			Type: "object",
 			Properties: map[string]*jsonschema.Schema{
-				"dirPath": {Type: "string", Description: "Subdirectory"},
+				"dirPath": {Type: "string", Description: "Subdirectory (\"path\" is accepted as an alias). Omit to list the vault root."},
 			},
 		},
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, DestructiveHint: boolPtr(false)},
@@ -148,15 +156,87 @@ func parseTarget(req *mcp.CallToolRequest) (targetType, target string, err error
 	return targetType, target, nil
 }
 
-func targetPathSegment(req *mcp.CallToolRequest) (string, error) {
-	targetType, target, err := parseTarget(req)
+// resolveTarget parses the target arguments and, for a heading given only by its
+// own text, expands it to the full path from the top-level heading. The Local
+// REST API addresses headings only by full path ("Topo::Seção"), so a bare
+// "Seção" otherwise fails with invalid-target.
+func resolveTarget(client *obsidian.Client, path string, req *mcp.CallToolRequest) (targetType, target string, err error) {
+	targetType, target, err = parseTarget(req)
+	if err != nil || targetType != "heading" {
+		return targetType, target, err
+	}
+	target, err = resolveHeading(client, path, target, getStringArg(req, "target_delimiter", ""))
+	return targetType, target, err
+}
+
+func resolveHeading(client *obsidian.Client, path, target, delimiter string) (string, error) {
+	if delimiter == "" {
+		delimiter = "::"
+	}
+	if strings.Contains(target, delimiter) {
+		return target, nil
+	}
+	res, err := client.Call("GET", "/vault/"+path, nil,
+		map[string]string{"Accept": "application/vnd.olrapi.document-map+json"})
 	if err != nil {
-		return "", err
+		// Leave the target as given: the note may not exist yet, or the plugin may
+		// predate the document map. The real call reports any problem.
+		return target, nil
 	}
+	var docMap struct {
+		Headings json.RawMessage `json:"headings"`
+	}
+	if json.Unmarshal(res, &docMap) != nil {
+		return target, nil
+	}
+	var matches []string
+	for _, segments := range headingPaths(docMap.Headings) {
+		if segments[len(segments)-1] == target {
+			matches = append(matches, strings.Join(segments, delimiter))
+		}
+	}
+	sort.Strings(matches)
+	switch len(matches) {
+	case 0:
+		return target, nil
+	case 1:
+		return matches[0], nil
+	default:
+		return "", fmt.Errorf("heading %q is ambiguous in %s; pass the full path, one of: %s",
+			target, path, strings.Join(matches, " | "))
+	}
+}
+
+// headingPaths lists every addressable heading as its path of segments. Plugin
+// 5.x sends the headings as a tree ({"Topo": {"Seção": {}}}); older versions
+// send "::"-joined strings. Both are accepted.
+func headingPaths(raw json.RawMessage) [][]string {
+	var flat []string
+	if json.Unmarshal(raw, &flat) == nil {
+		paths := make([][]string, 0, len(flat))
+		for _, h := range flat {
+			paths = append(paths, strings.Split(h, "::"))
+		}
+		return paths
+	}
+	var tree map[string]json.RawMessage
+	if json.Unmarshal(raw, &tree) != nil {
+		return nil
+	}
+	var paths [][]string
+	for heading, children := range tree {
+		paths = append(paths, []string{heading})
+		for _, child := range headingPaths(children) {
+			paths = append(paths, append([]string{heading}, child...))
+		}
+	}
+	return paths
+}
+
+func targetPathSegment(targetType, target, delimiter string) string {
 	if targetType == "" {
-		return "", nil
+		return ""
 	}
-	delimiter := getStringArg(req, "target_delimiter", "")
 	if delimiter == "" {
 		delimiter = "::"
 	}
@@ -164,7 +244,7 @@ func targetPathSegment(req *mcp.CallToolRequest) (string, error) {
 	for i, s := range segments {
 		segments[i] = url.PathEscape(s)
 	}
-	return "/" + targetType + "/" + strings.Join(segments, "/"), nil
+	return "/" + targetType + "/" + strings.Join(segments, "/")
 }
 
 func targetSegments(target, delimiter string) []string {
@@ -286,10 +366,11 @@ func handleReadNote(client *obsidian.Client) mcp.ToolHandler {
 		}
 		path = normalizePath(path)
 
-		targetPath, err := targetPathSegment(req)
+		targetType, target, err := resolveTarget(client, path, req)
 		if err != nil {
 			return errorResult(err.Error()), nil
 		}
+		targetPath := targetPathSegment(targetType, target, getStringArg(req, "target_delimiter", ""))
 		var headers map[string]string
 		if scope := getStringArg(req, "target_scope", ""); scope != "" {
 			if !validTargetScopes[scope] {
@@ -314,7 +395,7 @@ func registerReadNote(s *mcp.Server, client *obsidian.Client) {
 			Properties: map[string]*jsonschema.Schema{
 				"path":             {Type: "string"},
 				"target_type":      {Type: "string", Description: "Section type: heading, block, or frontmatter"},
-				"target":           {Type: "string", Description: "Heading text, block reference, or frontmatter key"},
+				"target":           {Type: "string", Description: "Heading text (its own text, or the full path like \"Top::Section\" when ambiguous), block reference, or frontmatter key"},
 				"target_scope":     {Type: "string", Description: "Scope for heading/block targets: content, marker, or markerAndContent"},
 				"target_delimiter": {Type: "string", Description: "Delimiter for nested headings (default: ::)"},
 			},
@@ -348,13 +429,25 @@ func resolveUpdateMethod(op string, hasTarget bool) (string, error) {
 
 type updateNoteParams struct {
 	path          string
+	operation     string
 	method        string
 	body          []byte
 	legacyBody    []byte
 	legacyHeaders map[string]string
 }
 
-func parseUpdateNote(req *mcp.CallToolRequest) (*updateNoteParams, error) {
+// noteExists reports whether a note is already at path. Any error other than a
+// 404 counts as existing, so a flaky read never unlocks an overwrite.
+func noteExists(client *obsidian.Client, path string) bool {
+	_, err := client.Call("GET", "/vault/"+path, nil)
+	var apiErr *obsidian.APIError
+	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusNotFound {
+		return false
+	}
+	return true
+}
+
+func parseUpdateNote(client *obsidian.Client, req *mcp.CallToolRequest) (*updateNoteParams, error) {
 	path, err := requireStringArg(req, "path")
 	if err != nil {
 		return nil, err
@@ -364,12 +457,25 @@ func parseUpdateNote(req *mcp.CallToolRequest) (*updateNoteParams, error) {
 	if err != nil {
 		return nil, err
 	}
-	op := getStringArg(req, "operation", "replace")
-	targetType, target, err := parseTarget(req)
+	targetType, target, err := resolveTarget(client, path, req)
 	if err != nil {
 		return nil, err
 	}
 	hasTarget := targetType != ""
+
+	// "replace" is only a safe default where nothing can be lost: a frontmatter
+	// key, or a note that does not exist yet. Overwriting a whole section or an
+	// existing note has to be asked for explicitly.
+	op := getStringArg(req, "operation", "")
+	if op == "" {
+		switch {
+		case targetType == "heading" || targetType == "block":
+			return nil, fmt.Errorf("operation is required when targeting a %s: use append or prepend to add to it, or replace to overwrite the whole section", targetType)
+		case !hasTarget && noteExists(client, path):
+			return nil, fmt.Errorf("note %s already exists: pass operation=replace to overwrite the whole note, operation=append to add to the end, or use search_replace to change part of it", path)
+		}
+		op = "replace"
+	}
 
 	method, err := resolveUpdateMethod(op, hasTarget)
 	if err != nil {
@@ -390,12 +496,18 @@ func parseUpdateNote(req *mcp.CallToolRequest) (*updateNoteParams, error) {
 		body = []byte(content)
 	}
 
-	return &updateNoteParams{path, method, body, legacyBody, legacyHeaders}, nil
+	return &updateNoteParams{path, op, method, body, legacyBody, legacyHeaders}, nil
+}
+
+var operationPastTense = map[string]string{
+	"replace": "replaced",
+	"append":  "appended",
+	"prepend": "prepended",
 }
 
 func handleUpdateNote(client *obsidian.Client) mcp.ToolHandler {
 	return func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		params, err := parseUpdateNote(req)
+		params, err := parseUpdateNote(client, req)
 		if err != nil {
 			return errorResult(err.Error()), nil
 		}
@@ -407,7 +519,7 @@ func handleUpdateNote(client *obsidian.Client) mcp.ToolHandler {
 		if err != nil {
 			return errorResult(err.Error()), nil
 		}
-		return textResult(fmt.Sprintf("Successfully %sed note: %s", getStringArg(req, "operation", "replace"), params.path)), nil
+		return textResult(fmt.Sprintf("Successfully %s note: %s", operationPastTense[params.operation], params.path)), nil
 	}
 }
 
@@ -420,9 +532,9 @@ func registerUpdateNote(s *mcp.Server, client *obsidian.Client) {
 			Properties: map[string]*jsonschema.Schema{
 				"path":                        {Type: "string"},
 				"content":                     {Type: "string"},
-				"operation":                   {Type: "string", Description: "replace (default), append, or prepend"},
+				"operation":                   {Type: "string", Description: "replace, append, or prepend. Required when targeting a heading or block, or when the note already exists; replace overwrites the whole target. To change part of a note, use search_replace."},
 				"target_type":                 {Type: "string", Description: "Section type: heading, block, or frontmatter"},
-				"target":                      {Type: "string", Description: "Heading text, block reference, or frontmatter key"},
+				"target":                      {Type: "string", Description: "Heading text (its own text, or the full path like \"Top::Section\" when ambiguous), block reference, or frontmatter key"},
 				"target_scope":                {Type: "string", Description: "Scope for heading/block targets: content, marker, or markerAndContent"},
 				"target_delimiter":            {Type: "string", Description: "Delimiter for nested headings (default: ::)"},
 				"create_target_if_missing":    {Type: "string", Description: "Create the target if it does not exist (true or false)"},

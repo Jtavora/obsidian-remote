@@ -43,6 +43,7 @@ Disk usage includes the Docker image (~2 GB base) plus vault storage. Typical ru
 
    **Server:**
    - `PUBLIC_HOST`: The external URL of this server (e.g., `https://obsidian.yourdomain.com`).
+   - `DISABLE_DELETE`: Set to `true` to leave `delete_note` out of the tool list, for vaults whose rules forbid deleting notes.
 
    **OAuth (Optional):**
    - `OAUTH_ISSUER`: Your OIDC issuer (e.g., `https://accounts.google.com`).

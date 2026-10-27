@@ -16,6 +16,9 @@ type Config struct {
 	OAuthAudience     string
 	OAuthClientSecret string
 	AllowedEmail      string
+	// DisableDelete leaves delete_note out of the tool list, for vaults whose
+	// rules forbid deleting notes (they are archived or retired instead).
+	DisableDelete bool
 }
 
 func getEnv(key, fallback string) string {
@@ -38,5 +41,6 @@ func Load() *Config {
 		OAuthAudience:     os.Getenv("OAUTH_AUDIENCE"),
 		OAuthClientSecret: os.Getenv("OAUTH_CLIENT_SECRET"),
 		AllowedEmail:      os.Getenv("OAUTH_ALLOWED_EMAIL"),
+		DisableDelete:     os.Getenv("DISABLE_DELETE") == "true",
 	}
 }
